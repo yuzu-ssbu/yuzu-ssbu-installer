@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
-cd /liftinstall
+cd /liftinstall || exit 1
 
-apt update
-apt install -y libwebkit2gtk-4.0-dev libssl-dev
+yarn --cwd ui
 
-curl https://sh.rustup.rs -sSf | sh -s -- -y
-export PATH=~/.cargo/bin:$PATH
-
-cargo build
+cargo build --release

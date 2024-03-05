@@ -1,22 +1,25 @@
 //! Resolves package names into a metadata + version object.
 
+use std::cmp::Ordering;
 use std::env::consts::OS;
 
-use installer::InstallerFramework;
+use crate::installer::InstallerFramework;
 
-use tasks::Task;
-use tasks::TaskDependency;
-use tasks::TaskMessage;
-use tasks::TaskParamType;
+use crate::sources::types::VersionTarget;
+use crate::tasks::Task;
+use crate::tasks::TaskDependency;
+use crate::tasks::TaskMessage;
+use crate::tasks::TaskParamType;
 
-use config::PackageDescription;
+use crate::config::PackageDescription;
 
 use regex::Regex;
 
-use logging::LoggingErrors;
+use crate::logging::LoggingErrors;
 
 pub struct ResolvePackageTask {
     pub name: String,
+    pub version_target: VersionTarget,
 }
 
 impl Task for ResolvePackageTask {
@@ -24,7 +27,7 @@ impl Task for ResolvePackageTask {
         &mut self,
         input: Vec<TaskParamType>,
         context: &mut InstallerFramework,
-        messenger: &Fn(&TaskMessage),
+        messenger: &dyn Fn(&TaskMessage),
     ) -> Result<TaskParamType, String> {
         assert_eq!(input.len(), 0);
         let mut metadata: Option<PackageDescription> = None;
@@ -40,7 +43,7 @@ impl Task for ResolvePackageTask {
             }
         }
 
-        let package = match metadata {
+        let mut package = match metadata {
             Some(v) => v,
             None => return Err(format!("Package {:?} could not be found.", self.name)),
         };
@@ -66,11 +69,16 @@ impl Task for ResolvePackageTask {
             Err(v) => return Err(format!("An error occurred while compiling regex: {:?}", v)),
         };
 
-        // Find the latest release in here
-        let latest_result = results
-            .into_iter()
-            .filter(|f| f.files.iter().filter(|x| regex.is_match(&x.name)).count() > 0)
-            .max_by_key(|f| f.version.clone());
+        let latest_result = match &self.version_target {
+            VersionTarget::Specific(v) => results
+                .into_iter()
+                .filter(|f| f.files.iter().filter(|x| regex.is_match(&x.name)).count() > 0)
+                .find(|f| f.version.cmp(v) == Ordering::Equal),
+            VersionTarget::Latest => results
+                .into_iter()
+                .filter(|f| f.files.iter().filter(|x| regex.is_match(&x.name)).count() > 0)
+                .max_by_key(|f| f.version.clone()),
+        };
 
         let latest_result = match latest_result {
             Some(v) => v,

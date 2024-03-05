@@ -1,5 +1,3 @@
-extern crate walkdir;
-
 #[cfg(windows)]
 extern crate winres;
 
@@ -11,23 +9,21 @@ extern crate serde;
 extern crate serde_derive;
 extern crate toml;
 
-use walkdir::WalkDir;
+extern crate which;
 
 use std::env;
+use std::io::Write;
 use std::path::PathBuf;
 
 use std::fs::copy;
-use std::fs::create_dir_all;
 use std::fs::File;
 
-use std::io::BufRead;
-use std::io::BufReader;
 use std::io::Read;
-use std::io::Write;
+use std::process::Command;
 
 use std::env::consts::OS;
 
-const FILES_TO_PREPROCESS: &'static [&'static str] = &["helpers.js", "views.js"];
+use image::imageops::FilterType;
 
 /// Describes the application itself.
 #[derive(Debug, Deserialize)]
@@ -39,7 +35,7 @@ pub struct BaseAttributes {
 #[cfg(windows)]
 fn handle_binary(config: &BaseAttributes) {
     let mut res = winres::WindowsResource::new();
-    res.set_icon("static/favicon.ico");
+    res.set_icon("ui/public/favicon.ico");
     res.set(
         "FileDescription",
         &format!("Interactive installer for {}", config.name),
@@ -53,6 +49,8 @@ fn handle_binary(config: &BaseAttributes) {
 
     cc::Build::new()
         .cpp(true)
+        .define("_WIN32_WINNT", Some("0x0600"))
+        .define("WINVER", Some("0x0600"))
         .file("src/native/interop.cpp")
         .compile("interop");
 }
@@ -62,8 +60,17 @@ fn handle_binary(_config: &BaseAttributes) {}
 
 fn main() {
     let output_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let current_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let ui_dir = current_dir.join("ui");
 
     let os = OS.to_lowercase();
+
+    #[cfg(windows)]
+    {
+        if std::fs::metadata("MicrosoftEdgeWebview2Setup.exe").is_err() {
+            panic!("Please download MicrosoftEdgeWebview2Setup.exe from https://go.microsoft.com/fwlink/p/?LinkId=2124703 and put the file at the workspace root!");
+        }
+    }
 
     // Find target config
     let target_config = PathBuf::from(format!("bootstrap.{}.toml", os));
@@ -92,80 +99,42 @@ fn main() {
     // Copy for the main build
     copy(&target_config, output_dir.join("bootstrap.toml")).expect("Unable to copy config file");
 
-    // Copy files from static/ to build dir
-    for entry in WalkDir::new("static") {
-        let entry = entry.expect("Unable to read output directory");
+    let yarn_binary =
+        which::which("yarn").expect("Failed to find yarn - please go ahead and install it!");
 
-        let output_file = output_dir.join(entry.path());
+    // bundle the icon
+    let mut f = File::create(output_dir.join("icon-data.bin")).unwrap();
+    let icon_file = image::open("ui/public/favicon.ico").expect("Unable to read the icon file");
+    let icon_data = icon_file
+        .resize_exact(48, 48, FilterType::Triangle)
+        .to_rgba8();
+    f.write_all(&icon_data.into_vec()).unwrap();
 
-        if entry.path().is_dir() {
-            create_dir_all(output_file).expect("Unable to create dir");
-        } else {
-            let filename = entry
-                .path()
-                .file_name()
-                .expect("Unable to parse filename")
+    // Build and deploy frontend files
+    Command::new(&yarn_binary)
+        .arg("--version")
+        .spawn()
+        .expect("Yarn could not be launched");
+    Command::new(&yarn_binary)
+        .arg("--cwd")
+        .arg(ui_dir.to_str().expect("Unable to covert path"))
+        .spawn()
+        .unwrap()
+        .wait()
+        .expect("Unable to install Node.JS dependencies using Yarn");
+    let return_code = Command::new(&yarn_binary)
+        .args(&[
+            "--cwd",
+            ui_dir.to_str().expect("Unable to covert path"),
+            "run",
+            "build",
+            "--dest",
+            output_dir
+                .join("static")
                 .to_str()
-                .expect("Unable to convert to string");
-
-            if FILES_TO_PREPROCESS.contains(&filename) {
-                // Do basic preprocessing - transcribe template string
-                let source = BufReader::new(File::open(entry.path()).expect("Unable to copy file"));
-                let mut target = File::create(output_file).expect("Unable to copy file");
-
-                let mut is_template_string = false;
-
-                for line in source.lines() {
-                    let line = line.expect("Unable to read line from JS file");
-
-                    let mut is_break = false;
-                    let mut is_quote = false;
-
-                    let mut output_line = String::new();
-
-                    if is_template_string {
-                        output_line += "\"";
-                    }
-
-                    for c in line.chars() {
-                        if c == '\\' {
-                            is_break = true;
-                            output_line.push('\\');
-                            continue;
-                        }
-
-                        if (c == '\"' || c == '\'') && !is_break && !is_template_string {
-                            is_quote = !is_quote;
-                        }
-
-                        if c == '`' && !is_break && !is_quote {
-                            output_line += "\"";
-                            is_template_string = !is_template_string;
-                            continue;
-                        }
-
-                        if c == '"' && !is_break && is_template_string {
-                            output_line += "\\\"";
-                            continue;
-                        }
-
-                        is_break = false;
-                        output_line.push(c);
-                    }
-
-                    if is_template_string {
-                        output_line += "\" +";
-                    }
-
-                    output_line.push('\n');
-
-                    target
-                        .write(output_line.as_bytes())
-                        .expect("Unable to write line");
-                }
-            } else {
-                copy(entry.path(), output_file).expect("Unable to copy file");
-            }
-        }
-    }
+                .expect("Unable to convert path"),
+        ])
+        .status()
+        .expect("Unable to build frontend assets using Webpack");
+    assert!(return_code.success());
 }

@@ -1,14 +1,14 @@
 //! Verifies that this is the only running instance of the installer, and that no application is running.
 
-use installer::InstallerFramework;
+use crate::installer::InstallerFramework;
 
-use tasks::Task;
-use tasks::TaskDependency;
-use tasks::TaskMessage;
-use tasks::TaskParamType;
+use crate::tasks::Task;
+use crate::tasks::TaskDependency;
+use crate::tasks::TaskMessage;
+use crate::tasks::TaskParamType;
 
-use native::Process;
-use native::get_process_names;
+use crate::native::get_process_names;
+use crate::native::Process;
 
 use std::process;
 
@@ -19,11 +19,11 @@ impl Task for EnsureOnlyInstanceTask {
         &mut self,
         input: Vec<TaskParamType>,
         context: &mut InstallerFramework,
-        _messenger: &Fn(&TaskMessage),
+        _messenger: &dyn Fn(&TaskMessage),
     ) -> Result<TaskParamType, String> {
         assert_eq!(input.len(), 0);
 
-        let current_pid =  process::id() as usize;
+        let current_pid = process::id() as usize;
         for Process { pid, name } in get_process_names() {
             if pid == current_pid {
                 continue;
@@ -32,13 +32,13 @@ impl Task for EnsureOnlyInstanceTask {
             let exe = name;
 
             if exe.ends_with("maintenancetool.exe") || exe.ends_with("maintenancetool") {
-                return Err(format!("Maintenance tool is already running!"));
+                return Err("Maintenance tool is already running!".to_string());
             }
 
             for package in &context.database.packages {
                 for file in &package.files {
                     if exe.ends_with(file) {
-                        return Err(format!("The installed application is currently running!"));
+                        return Err("The installed application is currently running!".to_string());
                     }
                 }
             }
@@ -52,6 +52,6 @@ impl Task for EnsureOnlyInstanceTask {
     }
 
     fn name(&self) -> String {
-        format!("EnsureOnlyInstanceTask")
+        "EnsureOnlyInstanceTask".to_string()
     }
 }

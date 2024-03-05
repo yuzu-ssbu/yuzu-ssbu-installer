@@ -1,32 +1,37 @@
 //! Installs a specific package.
 
-use installer::InstallerFramework;
+use crate::installer::InstallerFramework;
 
-use tasks::download_pkg::DownloadPackageTask;
-use tasks::install_shortcuts::InstallShortcutsTask;
-use tasks::save_database::SaveDatabaseTask;
-use tasks::uninstall_pkg::UninstallPackageTask;
-use tasks::Task;
-use tasks::TaskDependency;
-use tasks::TaskMessage;
-use tasks::TaskOrdering;
-use tasks::TaskParamType;
+use crate::sources::types::VersionTarget;
+use crate::tasks::download_pkg::DownloadPackageTask;
+use crate::tasks::install_shortcuts::InstallShortcutsTask;
+use crate::tasks::save_database::SaveDatabaseTask;
+use crate::tasks::uninstall_pkg::UninstallPackageTask;
+use crate::tasks::Task;
+use crate::tasks::TaskDependency;
+use crate::tasks::TaskMessage;
+use crate::tasks::TaskOrdering;
+use crate::tasks::TaskParamType;
 
-use config::PackageDescription;
-use installer::LocalInstallation;
+use crate::config::PackageDescription;
+use crate::installer::LocalInstallation;
 
 use std::fs::create_dir_all;
 use std::io::copy;
 
-use logging::LoggingErrors;
+use crate::logging::LoggingErrors;
 
-use archives;
+use crate::archives;
 
+use crate::tasks::install_desktop_shortcut::InstallDesktopShortcutTask;
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::path::Path;
 
 pub struct InstallPackageTask {
     pub name: String,
+    pub version_target: VersionTarget,
+    pub create_desktop_shortcuts: bool,
 }
 
 impl Task for InstallPackageTask {
@@ -34,7 +39,7 @@ impl Task for InstallPackageTask {
         &mut self,
         mut input: Vec<TaskParamType>,
         context: &mut InstallerFramework,
-        messenger: &Fn(&TaskMessage),
+        messenger: &dyn Fn(&TaskMessage),
     ) -> Result<TaskParamType, String> {
         messenger(&TaskMessage::DisplayMessage(
             &format!("Installing package {:?}...", self.name),
@@ -66,20 +71,20 @@ impl Task for InstallPackageTask {
             None => return Err(format!("Package {:?} could not be found.", self.name)),
         };
 
-        // Grab data from the shortcut generator
-        let shortcuts = input.pop().log_expect("Should have input from resolver!");
-        let shortcuts = match shortcuts {
-            TaskParamType::GeneratedShortcuts(files) => files,
-            // If the resolver returned early, we need to unwind
+        // Ignore input from the uninstaller - no useful information passed
+        // If a previous task Breaks, then just early exit
+        match input
+            .pop()
+            .log_expect("Install Package Task should have guaranteed output!")
+        {
             TaskParamType::Break => return Ok(TaskParamType::None),
-            _ => return Err("Unexpected shortcuts param type to install package".to_string()),
+            _ => (),
         };
 
-        // Ignore input from the uninstaller - no useful information passed
-        input.pop();
-
         // Grab data from the resolver
-        let data = input.pop().log_expect("Should have input from resolver!");
+        let data = input
+            .pop()
+            .log_expect("Install Package Task should have input from resolver!");
         let (version, file, data) = match data {
             TaskParamType::FileContents(version, file, data) => (version, file, data),
             _ => return Err("Unexpected file contents param type to install package".to_string()),
@@ -139,7 +144,7 @@ impl Task for InstallPackageTask {
             info!("Creating file: {:?}", string_name);
 
             if !installed_files.contains(&string_name) {
-                installed_files.push(string_name.to_string());
+                installed_files.push(string_name);
             }
 
             let mut file_metadata = OpenOptions::new();
@@ -166,11 +171,17 @@ impl Task for InstallPackageTask {
             Ok(())
         })?;
 
+        let version_target_is_latest = match &self.version_target {
+            VersionTarget::Latest => true,
+            _ => false,
+        };
+
         // Save metadata about this package
         context.database.packages.push(LocalInstallation {
-            name: package.name.to_owned(),
+            name: package.name,
             version,
-            shortcuts,
+            latest: version_target_is_latest,
+            shortcuts: HashSet::new(),
             files: installed_files,
         });
 
@@ -185,6 +196,7 @@ impl Task for InstallPackageTask {
                 TaskOrdering::Pre,
                 Box::new(DownloadPackageTask {
                     name: self.name.clone(),
+                    version_target: self.version_target.clone(),
                 }),
             ),
             TaskDependency::build(
@@ -195,9 +207,16 @@ impl Task for InstallPackageTask {
                 }),
             ),
             TaskDependency::build(
-                TaskOrdering::Pre,
+                TaskOrdering::Post,
                 Box::new(InstallShortcutsTask {
                     name: self.name.clone(),
+                }),
+            ),
+            TaskDependency::build(
+                TaskOrdering::Post,
+                Box::new(InstallDesktopShortcutTask {
+                    name: self.name.clone(),
+                    should_run: self.create_desktop_shortcuts,
                 }),
             ),
             TaskDependency::build(TaskOrdering::Post, Box::new(SaveDatabaseTask {})),

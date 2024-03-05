@@ -7,9 +7,9 @@ use reqwest::StatusCode;
 
 use serde_json;
 
-use sources::types::*;
+use crate::sources::types::*;
 
-use http::build_client;
+use crate::http::build_client;
 
 pub struct GithubReleases {}
 
@@ -41,17 +41,19 @@ impl ReleaseSource for GithubReleases {
             .get(&format!(
                 "https://api.github.com/repos/{}/releases",
                 config.repo
-            )).header(USER_AGENT, "liftinstall (j-selby)")
+            ))
+            .header(USER_AGENT, "liftinstall (j-selby)")
             .send()
             .map_err(|x| format!("Error while sending HTTP request: {:?}", x))?;
 
         match response.status() {
             StatusCode::OK => {}
             StatusCode::FORBIDDEN => {
-                return Err(format!(
+                return Err(
                     "GitHub is rate limiting you. Try moving to a internet connection \
                      that isn't shared, and/or disabling VPNs."
-                ));
+                        .to_string(),
+                );
             }
             _ => {
                 return Err(format!("Bad status code: {:?}.", response.status()));
@@ -78,6 +80,11 @@ impl ReleaseSource for GithubReleases {
                 None => return Err("JSON payload missing information about ID".to_string()),
             };
 
+            let name: String = match entry["name"].as_str() {
+                Some(v) => v.to_string(),
+                None => return Err("JSON payload missing information about name".to_string()),
+            };
+
             let assets = match entry["assets"].as_array() {
                 Some(v) => v,
                 None => return Err("JSON payload not an array".to_string()),
@@ -87,24 +94,30 @@ impl ReleaseSource for GithubReleases {
                 let string = match asset["name"].as_str() {
                     Some(v) => v,
                     None => {
-                        return Err("JSON payload missing information about release name".to_string())
+                        return Err(
+                            "JSON payload missing information about release name".to_string()
+                        );
                     }
                 };
 
                 let url = match asset["browser_download_url"].as_str() {
                     Some(v) => v,
                     None => {
-                        return Err("JSON payload missing information about release URL".to_string())
+                        return Err(
+                            "JSON payload missing information about release URL".to_string()
+                        );
                     }
                 };
 
                 files.push(File {
                     name: string.to_string(),
                     url: url.to_string(),
+                    requires_authorization: false,
                 });
             }
 
             results.push(Release {
+                name: name,
                 version: Version::new_number(id),
                 files,
             });

@@ -1,21 +1,21 @@
 //! Uninstalls a specific package.
 
-use installer::InstallerFramework;
+use crate::installer::InstallerFramework;
 
-use tasks::save_database::SaveDatabaseTask;
-use tasks::Task;
-use tasks::TaskDependency;
-use tasks::TaskMessage;
-use tasks::TaskOrdering;
-use tasks::TaskParamType;
+use crate::tasks::save_database::SaveDatabaseTask;
+use crate::tasks::Task;
+use crate::tasks::TaskDependency;
+use crate::tasks::TaskMessage;
+use crate::tasks::TaskOrdering;
+use crate::tasks::TaskParamType;
 
-use installer::LocalInstallation;
+use crate::installer::LocalInstallation;
 
 use std::fs::remove_dir;
 use std::fs::remove_file;
 
-use logging::LoggingErrors;
-use tasks::uninstall_shortcuts::UninstallShortcutsTask;
+use crate::logging::LoggingErrors;
+use crate::tasks::uninstall_shortcuts::UninstallShortcutsTask;
 
 pub struct UninstallPackageTask {
     pub name: String,
@@ -27,7 +27,7 @@ impl Task for UninstallPackageTask {
         &mut self,
         input: Vec<TaskParamType>,
         context: &mut InstallerFramework,
-        messenger: &Fn(&TaskMessage),
+        messenger: &dyn Fn(&TaskMessage),
     ) -> Result<TaskParamType, String> {
         assert_eq!(input.len(), 1);
 
@@ -44,7 +44,7 @@ impl Task for UninstallPackageTask {
             }
         }
 
-        let mut package = match metadata {
+        let package = match metadata {
             Some(v) => v,
             None => {
                 if self.optional {
@@ -63,8 +63,7 @@ impl Task for UninstallPackageTask {
             0.0,
         ));
 
-        // Reverse, as to delete directories last
-        package.files.reverse();
+        let mut directories = Vec::new();
 
         let max = package.files.len();
         for (i, file) in package.files.iter().enumerate() {
@@ -78,7 +77,9 @@ impl Task for UninstallPackageTask {
             ));
 
             let result = if file.is_dir() {
-                remove_dir(file)
+                // we don't delete directory just yet
+                directories.push(file);
+                Ok(())
             } else {
                 remove_file(file)
             };
@@ -86,6 +87,17 @@ impl Task for UninstallPackageTask {
             if let Err(v) = result {
                 error!("Failed to delete file: {:?}", v);
             }
+        }
+
+        // sort directories by reverse depth order
+        directories.sort_by(|a, b| {
+            let depth_a = a.components().fold(0usize, |acc, _| acc + 1);
+            let depth_b = b.components().fold(0usize, |acc, _| acc + 1);
+            depth_b.cmp(&depth_a)
+        });
+        for i in directories.iter() {
+            info!("Deleting directory: {:?}", i);
+            remove_dir(i).ok();
         }
 
         Ok(TaskParamType::None)

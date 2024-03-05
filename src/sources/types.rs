@@ -23,9 +23,14 @@ impl Version {
     fn coarse_into_semver(&self) -> SemverVersion {
         match *self {
             Version::Semver(ref version) => version.to_owned(),
-            Version::Integer(ref version) => {
-                SemverVersion::from((version.to_owned(), 0 as u64, 0 as u64))
-            }
+            Version::Integer(ref version) => SemverVersion::new(version.to_owned(), 0u64, 0u64),
+        }
+    }
+
+    pub fn to_string(&self) -> String {
+        match *self {
+            Version::Semver(ref version) => version.to_string(),
+            Version::Integer(ref version) => version.to_string(),
         }
     }
 
@@ -62,17 +67,19 @@ impl Ord for Version {
 }
 
 /// A individual file in a release.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct File {
     pub name: String,
     pub url: String,
+    pub requires_authorization: bool,
 }
 
 impl File {}
 
 /// A individual release of an application.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Release {
+    pub name: String,
     pub version: Version,
     pub files: Vec<File>,
 }
@@ -82,4 +89,10 @@ pub trait ReleaseSource {
     /// Gets a list of the available releases from this source. Should cache internally
     /// if possible using a mutex.
     fn get_current_releases(&self, config: &TomlValue) -> Result<Vec<Release>, String>;
+}
+
+#[derive(Debug, Clone)]
+pub enum VersionTarget {
+    Latest,
+    Specific(Version),
 }

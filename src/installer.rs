@@ -4,6 +4,7 @@
 
 use serde_json;
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::fs::OpenOptions;
 
@@ -18,29 +19,33 @@ use std::sync::mpsc::Sender;
 use std::io::copy;
 use std::io::Cursor;
 
-use std::process::exit;
 use std::process::Command;
+use std::process::{exit, Stdio};
 
-use config::BaseAttributes;
-use config::Config;
+use crate::config::BaseAttributes;
+use crate::config::Config;
 
-use sources::types::Version;
+use crate::sources::types::Version;
 
-use tasks::install::InstallTask;
-use tasks::uninstall::UninstallTask;
-use tasks::uninstall_global_shortcut::UninstallGlobalShortcutsTask;
-use tasks::DependencyTree;
-use tasks::TaskMessage;
+use crate::sources::types::VersionTarget;
+use crate::tasks::install::InstallTask;
+use crate::tasks::uninstall::UninstallTask;
+use crate::tasks::uninstall_global_shortcut::UninstallGlobalShortcutsTask;
+use crate::tasks::DependencyTree;
+use crate::tasks::TaskMessage;
 
-use logging::LoggingErrors;
+use crate::logging::LoggingErrors;
 
 use dirs::home_dir;
 
+use std::collections::HashSet;
 use std::fs::remove_file;
 
-use http;
+use crate::http;
 
-use number_prefix::{decimal_prefix, Prefixed, Standalone};
+use number_prefix::NumberPrefix::{self, Prefixed, Standalone};
+
+use crate::native;
 
 /// A message thrown during the installation of packages.
 #[derive(Serialize)]
@@ -48,7 +53,16 @@ pub enum InstallMessage {
     Status(String, f64),
     PackageInstalled,
     Error(String),
+    AuthorizationRequired(String),
     EOF,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct Credentials {
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub token: String,
 }
 
 /// Metadata about the current installation itself.
@@ -56,6 +70,8 @@ pub enum InstallMessage {
 pub struct InstallationDatabase {
     pub packages: Vec<LocalInstallation>,
     pub shortcuts: Vec<String>,
+    #[serde(default)]
+    pub credentials: Credentials,
 }
 
 impl InstallationDatabase {
@@ -64,6 +80,10 @@ impl InstallationDatabase {
         InstallationDatabase {
             packages: Vec::new(),
             shortcuts: Vec::new(),
+            credentials: Credentials {
+                username: String::new(),
+                token: String::new(),
+            },
         }
     }
 }
@@ -80,6 +100,8 @@ pub struct InstallerFramework {
     // If we just completed an uninstall, and we should clean up after ourselves.
     pub burn_after_exit: bool,
     pub launcher_path: Option<String>,
+    pub launcher_args: Option<Vec<String>>,
+    pub is_windows: bool,
 }
 
 /// Contains basic properties on the status of the session. Subset of InstallationFramework.
@@ -90,6 +112,7 @@ pub struct InstallationStatus {
     pub preexisting_install: bool,
     pub is_launcher: bool,
     pub launcher_path: Option<String>,
+    pub launcher_args: Option<Vec<String>>,
 }
 
 /// Tracks the state of a local installation
@@ -97,22 +120,29 @@ pub struct InstallationStatus {
 pub struct LocalInstallation {
     pub name: String,
     pub version: Version,
+    pub latest: bool,
     /// Relative paths to generated files
     pub files: Vec<String>,
     /// Absolute paths to generated shortcut files
-    pub shortcuts: Vec<String>,
+    pub shortcuts: HashSet<String>,
 }
 
 macro_rules! declare_messenger_callback {
     ($target:expr) => {
-        &|msg: &TaskMessage| match msg {
-            &TaskMessage::DisplayMessage(msg, progress) => {
+        &|msg: &TaskMessage| match *msg {
+            TaskMessage::DisplayMessage(msg, progress) => {
                 if let Err(v) = $target.send(InstallMessage::Status(msg.to_string(), progress as _))
                 {
                     error!("Failed to submit queue message: {:?}", v);
                 }
             }
-            &TaskMessage::PackageInstalled => {
+            TaskMessage::AuthorizationRequired(msg) => {
+                if let Err(v) = $target.send(InstallMessage::AuthorizationRequired(msg.to_string()))
+                {
+                    error!("Failed to submit queue message: {:?}", v);
+                }
+            }
+            TaskMessage::PackageInstalled => {
                 if let Err(v) = $target.send(InstallMessage::PackageInstalled) {
                     error!("Failed to submit queue message: {:?}", v);
                 }
@@ -151,11 +181,14 @@ impl InstallerFramework {
     /// items: Array of named packages to be installed/kept
     /// messages: Channel used to send progress messages
     /// fresh_install: If the install directory must be empty
+    /// force_install: If the install directory should be erased first
     pub fn install(
         &mut self,
-        items: Vec<String>,
+        items: HashMap<String, VersionTarget>,
         messages: &Sender<InstallMessage>,
         fresh_install: bool,
+        create_desktop_shortcuts: bool,
+        force_install: bool,
     ) -> Result<(), String> {
         info!(
             "Framework: Installing {:?} to {:?}",
@@ -169,7 +202,7 @@ impl InstallerFramework {
         let mut uninstall_items = Vec::new();
         if !fresh_install {
             for package in &self.database.packages {
-                if !items.contains(&package.name) {
+                if !items.contains_key(&package.name) {
                     uninstall_items.push(package.name.clone());
                 }
             }
@@ -184,6 +217,8 @@ impl InstallerFramework {
             items,
             uninstall_items,
             fresh_install,
+            create_desktop_shortcuts,
+            force_install,
         });
 
         let mut tree = DependencyTree::build(task);
@@ -250,7 +285,7 @@ impl InstallerFramework {
         let mut downloaded = 0;
         let mut data_storage: Vec<u8> = Vec::new();
 
-        http::stream_file(tool, |data, size| {
+        http::stream_file(tool, None, |data, size| {
             {
                 data_storage.extend_from_slice(&data);
             }
@@ -264,11 +299,11 @@ impl InstallerFramework {
             };
 
             // Pretty print data volumes
-            let pretty_current = match decimal_prefix(downloaded as f64) {
+            let pretty_current = match NumberPrefix::decimal(downloaded as f64) {
                 Standalone(bytes) => format!("{} bytes", bytes),
                 Prefixed(prefix, n) => format!("{:.0} {}B", n, prefix),
             };
-            let pretty_total = match decimal_prefix(size as f64) {
+            let pretty_total = match NumberPrefix::decimal(size as f64) {
                 Standalone(bytes) => format!("{} bytes", bytes),
                 Prefixed(prefix, n) => format!("{:.0} {}B", n, prefix),
             };
@@ -328,7 +363,8 @@ impl InstallerFramework {
                 x.to_str()
                     .log_expect("Unable to convert argument to String")
                     .to_string()
-            }).collect();
+            })
+            .collect();
 
         {
             let new_app_file = match File::create(&args_file) {
@@ -390,7 +426,38 @@ impl InstallerFramework {
             preexisting_install: self.preexisting_install,
             is_launcher: self.is_launcher,
             launcher_path: self.launcher_path.clone(),
+            launcher_args: self.launcher_args.clone(),
         }
+    }
+
+    /// Shuts down the installer instance.
+    pub fn shutdown(&mut self) -> Result<(), String> {
+        info!("Shutting down installer framework...");
+
+        if let Some(ref v) = self.launcher_path.take() {
+            info!("Launching {:?}", v);
+
+            let mut command = Command::new(v);
+            if let Some(args) = self.launcher_args.take() {
+                for launcher_arg in args {
+                    command.arg(launcher_arg);
+                }
+            }
+
+            command
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|x| format!("Unable to start application: {:?}", x))?;
+        }
+
+        if self.burn_after_exit {
+            info!("Requesting that self be deleted after exit.");
+            native::burn_on_exit(&self.base_attributes.name);
+            self.burn_after_exit = false;
+        }
+
+        Ok(())
     }
 
     /// Creates a new instance of the Installer Framework with a specified Config.
@@ -404,6 +471,27 @@ impl InstallerFramework {
             is_launcher: false,
             burn_after_exit: false,
             launcher_path: None,
+            launcher_args: None,
+            is_windows: cfg!(windows),
+        }
+    }
+
+    /// The special recovery mode for the Installer Framework.
+    pub fn new_recovery_mode(attrs: BaseAttributes, install_path: &Path) -> Self {
+        InstallerFramework {
+            base_attributes: BaseAttributes {
+                recovery: true,
+                ..attrs
+            },
+            config: None,
+            database: InstallationDatabase::new(),
+            install_path: Some(install_path.to_path_buf()),
+            preexisting_install: true,
+            is_launcher: false,
+            burn_after_exit: false,
+            launcher_path: None,
+            launcher_args: None,
+            is_windows: cfg!(windows),
         }
     }
 
@@ -431,6 +519,8 @@ impl InstallerFramework {
             is_launcher: false,
             burn_after_exit: false,
             launcher_path: None,
+            launcher_args: None,
+            is_windows: cfg!(windows),
         })
     }
 }

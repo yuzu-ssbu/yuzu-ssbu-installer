@@ -1,17 +1,17 @@
 //! Generates shortcuts for a specified file.
 
-use installer::InstallerFramework;
+use crate::installer::InstallerFramework;
 
-use tasks::Task;
-use tasks::TaskDependency;
-use tasks::TaskMessage;
-use tasks::TaskParamType;
+use crate::tasks::Task;
+use crate::tasks::TaskDependency;
+use crate::tasks::TaskMessage;
+use crate::tasks::TaskParamType;
 
-use config::PackageDescription;
+use crate::config::PackageDescription;
 
-use logging::LoggingErrors;
+use crate::logging::LoggingErrors;
 
-use native::create_shortcut;
+use crate::native::create_shortcut;
 
 pub struct InstallShortcutsTask {
     pub name: String,
@@ -22,7 +22,7 @@ impl Task for InstallShortcutsTask {
         &mut self,
         _: Vec<TaskParamType>,
         context: &mut InstallerFramework,
-        messenger: &Fn(&TaskMessage),
+        messenger: &dyn Fn(&TaskMessage),
     ) -> Result<TaskParamType, String> {
         messenger(&TaskMessage::DisplayMessage(
             &format!("Generating shortcuts for package {:?}...", self.name),
@@ -76,14 +76,42 @@ impl Task for InstallShortcutsTask {
                 .to_str()
                 .log_expect("Unable to build shortcut metadata (exe)");
 
+            let icon_path: &str;
+            let icon_path_owned: String;
+            if shortcut.icon_relative_path == "" {
+                icon_path_owned = exe_path.to_string();
+            } else {
+                let icon_relative = path.join(shortcut.icon_relative_path);
+                let path_str = icon_relative
+                    .to_str()
+                    .expect("Unable to build shortcut metadata (icon)");
+                icon_path_owned = path_str.to_string();
+            }
+            icon_path = &icon_path_owned;
+
+            let mut arg_str = String::from("");
+            for arg in shortcut.args {
+                arg_str = format!("{} --launcher_arg \"{}\"", arg_str, arg);
+            }
+
             installed_files.push(create_shortcut(
                 &shortcut.name,
                 &shortcut.description,
                 tool_path,
                 // TODO: Send by list
-                &format!("--launcher \"{}\"", exe_path),
+                &format!("--launcher \"{}\" {}", exe_path, arg_str).trim(),
                 &starting_dir,
+                exe_path,
+                icon_path,
             )?);
+        }
+
+        // Update the installed packages shortcuts information in the database
+        let packages = &mut context.database.packages;
+        for pack in packages {
+            if pack.name == self.name {
+                pack.shortcuts.extend(installed_files.clone());
+            }
         }
 
         Ok(TaskParamType::GeneratedShortcuts(installed_files))

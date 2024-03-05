@@ -7,10 +7,7 @@
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
-#[cfg(windows)]
-extern crate nfd;
-
-extern crate web_view;
+extern crate wry;
 
 extern crate futures;
 extern crate hyper;
@@ -30,7 +27,7 @@ extern crate semver;
 
 extern crate dirs;
 extern crate tar;
-extern crate xz_decom;
+extern crate xz2;
 extern crate zip;
 
 extern crate fern;
@@ -40,59 +37,44 @@ extern crate log;
 extern crate chrono;
 
 extern crate clap;
-
+#[cfg(windows)]
+extern crate widestring;
+#[cfg(windows)]
 extern crate winapi;
 
+#[cfg(not(windows))]
+extern crate slug;
+#[cfg(not(windows))]
+extern crate sysinfo;
+
+extern crate jsonwebtoken as jwt;
+
+extern crate base64;
+
 mod archives;
-mod assets;
 mod config;
+mod frontend;
 mod http;
 mod installer;
 mod logging;
 mod native;
-mod rest;
+mod self_update;
 mod sources;
 mod tasks;
 
-use web_view::*;
-
 use installer::InstallerFramework;
 
-#[cfg(windows)]
-use nfd::Response;
-
-use rest::WebServer;
-
-use std::net::TcpListener;
-use std::net::ToSocketAddrs;
-
-use std::sync::Arc;
-use std::sync::RwLock;
-
-use std::path::PathBuf;
-
-use std::process::exit;
-use std::process::Command;
-use std::{thread, time};
-
-use std::fs::remove_file;
-use std::fs::File;
-
 use logging::LoggingErrors;
+use std::path::PathBuf;
 
 use clap::App;
 use clap::Arg;
-use log::Level;
 
 use config::BaseAttributes;
+use std::fs;
+use std::process::{exit, Command, Stdio};
 
-static RAW_CONFIG: &'static str = include_str!(concat!(env!("OUT_DIR"), "/bootstrap.toml"));
-
-#[derive(Deserialize, Debug)]
-enum CallbackType {
-    SelectInstallDir { callback_name: String },
-    Log { msg: String, kind: String },
-}
+const RAW_CONFIG: &str = include_str!(concat!(env!("OUT_DIR"), "/bootstrap.toml"));
 
 fn main() {
     let config = BaseAttributes::from_toml_str(RAW_CONFIG).expect("Config file could not be read");
@@ -100,6 +82,7 @@ fn main() {
     logging::setup_logger(format!("{}_installer.log", config.name))
         .expect("Unable to setup logging!");
 
+    // Parse CLI arguments
     let app_name = config.name.clone();
 
     let app_about = format!("An interactive installer for {}", app_name);
@@ -112,7 +95,16 @@ fn main() {
                 .value_name("TARGET")
                 .help("Launches the specified executable after checking for updates")
                 .takes_value(true),
-        ).arg(
+        )
+        .arg(
+            Arg::with_name("launcher_arg")
+                .long("launcher_arg")
+                .value_name("ARG")
+                .help("Specify args to pass into the specified executable")
+                .takes_value(true)
+                .multiple(true),
+        )
+        .arg(
             Arg::with_name("swap")
                 .long("swap")
                 .value_name("TARGET")
@@ -125,208 +117,105 @@ fn main() {
 
     info!("{} installer", app_name);
 
+    // Handle self-updating if needed
     let current_exe = std::env::current_exe().log_expect("Current executable could not be found");
     let current_path = current_exe
         .parent()
         .log_expect("Parent directory of executable could not be found");
 
-    // Check to see if we are currently in a self-update
-    if let Some(to_path) = matches.value_of("swap") {
-        let to_path = PathBuf::from(to_path);
-
-        // Sleep a little bit to allow Windows to close the previous file handle
-        thread::sleep(time::Duration::from_millis(3000));
-
-        info!(
-            "Swapping installer from {} to {}",
-            current_exe.display(),
-            to_path.display()
-        );
-
-        // Attempt it a few times because Windows can hold a lock
-        for i in 1..=5 {
-            let swap_result = if cfg!(windows) {
-                use std::fs::copy;
-
-                copy(&current_exe, &to_path).map(|_x| ())
-            } else {
-                use std::fs::rename;
-
-                rename(&current_exe, &to_path)
-            };
-
-            match swap_result {
-                Ok(_) => break,
-                Err(e) => {
-                    if i < 5 {
-                        info!("Copy attempt failed: {:?}, retrying in 3 seconds.", e);
-                        thread::sleep(time::Duration::from_millis(3000));
-                    } else {
-                        let _: () = Err(e).log_expect("Copying new binary failed");
-                    }
-                }
-            }
-        }
-
-        Command::new(to_path)
-            .spawn()
-            .log_expect("Unable to start child process");
-
-        exit(0);
+    // Handle self-updating if needed
+    self_update::perform_swap(&current_exe, matches.value_of("swap"));
+    if let Some(new_matches) = self_update::check_args(reinterpret_app, current_path) {
+        matches = new_matches;
     }
+    self_update::cleanup(current_path);
 
-    // If we just finished a update, we need to inject our previous command line arguments
-    let args_file = current_path.join("args.json");
-
-    if args_file.exists() {
-        let database: Vec<String> = {
-            let metadata_file =
-                File::open(&args_file).log_expect("Unable to open args file handle");
-
-            serde_json::from_reader(metadata_file).log_expect("Unable to read metadata file")
-        };
-
-        matches = reinterpret_app.get_matches_from(database);
-
-        info!("Parsed command line arguments from original instance");
-        remove_file(args_file).log_expect("Unable to clean up args file");
-    }
-
-    // Cleanup any remaining new maintenance tool instances if they exist
-    if cfg!(windows) {
-        let updater_executable = current_path.join("maintenancetool_new.exe");
-
-        if updater_executable.exists() {
-            // Sleep a little bit to allow Windows to close the previous file handle
-            thread::sleep(time::Duration::from_millis(3000));
-
-            // Attempt it a few times because Windows can hold a lock
-            for i in 1..=5 {
-                let swap_result = remove_file(&updater_executable);
-                match swap_result {
-                    Ok(_) => break,
-                    Err(e) => {
-                        if i < 5 {
-                            info!("Cleanup attempt failed: {:?}, retrying in 3 seconds.", e);
-                            thread::sleep(time::Duration::from_millis(3000));
-                        } else {
-                            warn!("Deleting temp binary failed after 5 attempts: {:?}", e);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Load in metadata as to learn about the environment
+    // Load in metadata + setup the installer framework
+    let mut fresh_install = false;
     let metadata_file = current_path.join("metadata.json");
     let mut framework = if metadata_file.exists() {
         info!("Using pre-existing metadata file: {:?}", metadata_file);
-        InstallerFramework::new_with_db(config, current_path).log_expect("Unable to parse metadata")
+        InstallerFramework::new_with_db(config.clone(), current_path).unwrap_or_else(|e| {
+            error!("Failed to load metadata: {:?}", e);
+            warn!("Entering recovery mode");
+            InstallerFramework::new_recovery_mode(config, current_path)
+        })
     } else {
         info!("Starting fresh install");
+        fresh_install = true;
         InstallerFramework::new(config)
     };
+
+    // check for existing installs if we are running as a fresh install
+    let installed_path = PathBuf::from(framework.get_default_path().unwrap());
+    if fresh_install && installed_path.join("metadata.json").exists() {
+        info!("Existing install detected! Copying Trying to launch this install instead");
+        // Ignore the return value from this since it should exit the application if its successful
+        let _ = replace_existing_install(&current_exe, &installed_path);
+    }
 
     let is_launcher = if let Some(string) = matches.value_of("launcher") {
         framework.is_launcher = true;
         framework.launcher_path = Some(string.to_string());
+        let mut args: Vec<String> = Vec::new();
+        if let Some(values) = matches.values_of("launcher_arg") {
+            for value in values {
+                args.push(value.to_string());
+            }
+        }
+        framework.launcher_args = Some(args);
         true
     } else {
         false
     };
 
-    // Firstly, allocate us an epidermal port
-    let target_port = {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .log_expect("At least one local address should be free");
-        listener
-            .local_addr()
-            .log_expect("Should be able to pull address from listener")
-            .port()
+    // Start up the UI
+    frontend::launch(&app_name, is_launcher, framework);
+}
+
+fn replace_existing_install(current_exe: &PathBuf, installed_path: &PathBuf) -> Result<(), String> {
+    // Generate installer path
+    let platform_extension = if cfg!(windows) {
+        "maintenancetool.exe"
+    } else {
+        "maintenancetool"
     };
 
-    // Now, iterate over all ports
-    let addresses = "localhost:0"
-        .to_socket_addrs()
-        .log_expect("No localhost address found");
+    let new_tool = if cfg!(windows) {
+        "maintenancetool_new.exe"
+    } else {
+        "maintenancetool_new"
+    };
 
-    let mut servers = Vec::new();
-    let mut http_address = None;
-
-    let framework = Arc::new(RwLock::new(framework));
-
-    // Startup HTTP server for handling the web view
-    for mut address in addresses {
-        address.set_port(target_port);
-
-        let server = WebServer::with_addr(framework.clone(), address)
-            .log_expect("Failed to bind to address");
-
-        info!("Server: {:?}", address);
-
-        http_address = Some(address);
-
-        servers.push(server);
+    if let Err(v) = fs::copy(current_exe, installed_path.join(new_tool)) {
+        return Err(format!("Unable to copy installer binary: {:?}", v));
     }
 
-    let http_address = http_address.log_expect("No HTTP address found");
+    let existing = installed_path
+        .join(platform_extension)
+        .into_os_string()
+        .into_string();
+    let new = installed_path.join(new_tool).into_os_string().into_string();
+    if existing.is_ok() && new.is_ok() {
+        // Remove NTFS alternate stream which tells the operating system that the updater was downloaded from the internet
+        if cfg!(windows) {
+            let _ = fs::remove_file(
+                installed_path.join("maintenancetool_new.exe:Zone.Identifier:$DATA"),
+            );
+        }
+        info!("Launching {:?}", existing);
+        let success = Command::new(new.unwrap())
+            .arg("--swap")
+            .arg(existing.unwrap())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        if success.is_ok() {
+            exit(0);
+        } else {
+            error!("Unable to start existing yuzu maintenance tool. Launching old one instead");
+        }
+    }
 
-    let http_address = format!("http://localhost:{}", http_address.port());
-
-    // Init the web view
-    let size = if is_launcher { (600, 300) } else { (1024, 500) };
-
-    let resizable = false;
-    let debug = true;
-
-    run(
-        &format!("{} Installer", app_name),
-        Content::Url(http_address),
-        Some(size),
-        resizable,
-        debug,
-        |_| {},
-        |wv, msg, _| {
-            let command: CallbackType =
-                serde_json::from_str(msg).log_expect(&format!("Unable to parse string: {:?}", msg));
-
-            debug!("Incoming payload: {:?}", command);
-
-            match command {
-                CallbackType::SelectInstallDir { callback_name } => {
-                    #[cfg(windows)]
-                    let result = match nfd::open_pick_folder(None)
-                        .log_expect("Unable to open folder dialog")
-                    {
-                        Response::Okay(v) => v,
-                        _ => return,
-                    };
-
-                    #[cfg(not(windows))]
-                    let result =
-                        wv.dialog(Dialog::ChooseDirectory, "Select a install directory...", "");
-
-                    if !result.is_empty() {
-                        let result = serde_json::to_string(&result)
-                            .log_expect("Unable to serialize response");
-                        let command = format!("{}({});", callback_name, result);
-                        debug!("Injecting response: {}", command);
-                        wv.eval(&command);
-                    }
-                }
-                CallbackType::Log { msg, kind } => {
-                    let kind = match kind.as_ref() {
-                        "info" | "log" => Level::Info,
-                        "warn" => Level::Warn,
-                        "error" => Level::Error,
-                        _ => Level::Error,
-                    };
-
-                    log!(target: "liftinstall::frontend-js", kind, "{}", msg);
-                }
-            }
-        },
-        (),
-    );
+    Ok(())
 }
