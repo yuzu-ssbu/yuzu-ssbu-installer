@@ -13,7 +13,7 @@ launch_after_install = true
     match = "yuzu_gdrive_test.zip"
     allow_version_control = true
         [packages.source.config]
-        file_id = "1wSrf46PEMg8Z2DCAtthUOHubj4nWbaSb"
+        file_ids = ["1wSrf46PEMg8Z2DCAtthUOHubj4nWbaSb"]
     [[packages.shortcuts]]
     name = "yuzu"
     relative_path = "yuzu-windows-msvc/yuzu.exe"
