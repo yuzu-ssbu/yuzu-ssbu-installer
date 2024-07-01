@@ -9,11 +9,11 @@ icon = "thicc_logo_installer_shadow.png"
 default = true
 launch_after_install = true
     [packages.source]
-    name = "github"
-    match = "^yuzu-windows-msvc-[0-9]*-[0-9a-f]*.zip"
+    name = "gdrive"
+    match = "yuzu_gdrive_test.zip"
     allow_version_control = true
         [packages.source.config]
-        repo = "yuzu-ssbu/yuzu-mainline-builds"
+        file_id = "1wSrf46PEMg8Z2DCAtthUOHubj4nWbaSb"
     [[packages.shortcuts]]
     name = "yuzu"
     relative_path = "yuzu-windows-msvc/yuzu.exe"
