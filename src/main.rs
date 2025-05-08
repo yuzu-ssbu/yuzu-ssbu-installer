@@ -88,7 +88,7 @@ fn main() {
     let app_about = format!("An interactive installer for {}", app_name);
     let app = App::new(format!("{} installer", app_name))
         .version(env!("CARGO_PKG_VERSION"))
-        .about(app_about.as_ref())
+        .about(app_about.as_str())
         .arg(
             Arg::with_name("launcher")
                 .long("launcher")

@@ -20,6 +20,24 @@ launch_after_install = true
     description = "Launch yuzu"
 
 [[packages]]
+name = "Citron"
+description = "Latest release builds of Citron."
+icon = "thicc_logo_installer_shadow.png"
+default = true
+launch_after_install = true
+    [packages.source]
+    name = "gitlab"
+    match = "^Citron-Windows-Canary-Refresh_[0-9].[0-9].[0-9].zip"
+    allow_version_control = true
+        [packages.source.config]
+        base_url = "git.citron-emu.org"
+        project_id = 1
+    [[packages.shortcuts]]
+    name = "Citron"
+    relative_path = "$ROOT_NAME$/citron.exe"
+    description = "Launch Citron"
+
+[[packages]]
 name = "yuzu SSBU Optimizer"
 description = "Optimizes yuzu settings for SSBU and adds useful mods."
 icon = "yuzu_ssbu.png"
